@@ -11,6 +11,8 @@ A Python package with three utilities:
 ## Install
 
 ```bash
+cd math-package-tutorial
+pip install -e .                 # installing locally if no PyPI available
 pip install mathpackage          # from PyPI (after publishing)
 pip install -e ".[dev]"          # local editable install (for development)
 ```
