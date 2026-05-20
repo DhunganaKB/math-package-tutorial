@@ -49,6 +49,5 @@ jobs:
             --repository-url ${{ secrets.JFROG_URL }} \
             --username ${{ secrets.JFROG_USERNAME }} \
             --password ${{ secrets.JFROG_TOKEN }} \
-            --skip-existing \
             --non-interactive \
             dist/*
