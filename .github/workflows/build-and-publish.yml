@@ -1,0 +1,54 @@
+name: Build and Publish to JFrog
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Checkout the code from the repo
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Step 2: Set up Python
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Step 3: Install build and publish tools
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+
+      # Step 4: Install package dependencies (so build doesn't fail)
+      - name: Install package dependencies
+        run: pip install -e ".[dev]"
+
+      # Step 5: Run tests — build only proceeds if tests pass
+      - name: Run tests
+        run: pytest tests/ -v
+
+      # Step 6: Build the wheel and source distribution
+      - name: Build package
+        run: python -m build
+
+      # Step 7: Show what was built
+      - name: List built artifacts
+        run: ls -lh dist/
+
+      # Step 8: Upload to JFrog Artifactory
+      - name: Publish to JFrog
+        run: |
+          twine upload \
+            --repository-url ${{ secrets.JFROG_URL }} \
+            --username ${{ secrets.JFROG_USERNAME }} \
+            --password ${{ secrets.JFROG_TOKEN }} \
+            --skip-existing \
+            --non-interactive \
+            dist/*
