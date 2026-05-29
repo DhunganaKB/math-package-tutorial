@@ -1,0 +1,141 @@
+name: Lint, Test, and Security Scan
+
+on:
+  workflow_call:
+    inputs:
+      source_path:
+        description: "Path to Python source code (ruff, bandit, semgrep)"
+        required: true
+        type: string
+      requirements_path:
+        description: "Path to requirements.txt"
+        required: true
+        type: string
+      tests_path:
+        description: "Path to the tests directory"
+        required: true
+        type: string
+      semgrep_rules:
+        description: "Space-separated semgrep rule configs (e.g. 'p/python p/owasp-top-ten')"
+        required: true
+        type: string
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install dependencies
+        run: pip install -r "${{ inputs.requirements_path }}"
+
+      - name: Run ruff
+        id: ruff
+        continue-on-error: true
+        run: ruff check "${{ inputs.source_path }}" > ruff_output.txt 2>&1
+
+      - name: Post ruff findings as single PR comment
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RAW=$(cat ruff_output.txt)
+          if [ -z "$RAW" ]; then
+            printf "### Ruff Lint Findings\n\nNo issues found." > comment_body.txt
+          else
+            printf "### Ruff Lint Findings\n\`\`\`\n%s\n\`\`\`" "$RAW" > comment_body.txt
+          fi
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --repo ${{ github.repository }} \
+            --edit-last \
+            --body-file comment_body.txt 2>/dev/null || \
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --repo ${{ github.repository }} \
+            --body-file comment_body.txt
+
+      - name: Fail on ruff issues
+        if: steps.ruff.outcome == 'failure'
+        run: exit 1
+
+  test:
+    name: Unit Tests (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install dependencies
+        run: pip install -r "${{ inputs.requirements_path }}"
+
+      - name: Run pytest
+        run: pytest "${{ inputs.tests_path }}" -v --tb=short
+
+  pip-audit:
+    name: Dependency Vulnerability Scan (pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install dependencies
+        run: pip install -r "${{ inputs.requirements_path }}"
+
+      - name: Run pip-audit
+        run: pip-audit -r "${{ inputs.requirements_path }}" -f json -o pip_audit_results.json
+
+      - name: Upload pip-audit results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pip-audit-results
+          path: pip_audit_results.json
+          if-no-files-found: ignore
+
+  security-scan:
+    name: Static Security Scan (bandit + semgrep)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install dependencies
+        run: pip install -r "${{ inputs.requirements_path }}"
+
+      - name: Run bandit
+        id: bandit
+        continue-on-error: true
+        run: bandit -r "${{ inputs.source_path }}" -ll -f json -o bandit_results.json
+
+      - name: Upload bandit results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-results
+          path: bandit_results.json
+          if-no-files-found: ignore
+
+      - name: Fail on bandit issues
+        if: steps.bandit.outcome == 'failure'
+        run: exit 1
+
+      - name: Run semgrep
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: ${{ inputs.semgrep_rules }}
