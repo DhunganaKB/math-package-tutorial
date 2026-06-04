@@ -12,5 +12,5 @@ env/
 .pytest_cache/
 .coverage
 htmlcov/
-*.html
 *.pyc
+*.html
