@@ -1,48 +1,56 @@
 """
-LangfuseTracer — a reusable Langfuse observability abstraction.
+LangfuseTracer — a reusable Langfuse v3 observability abstraction.
+
+Langfuse v3 is fully context-manager based. There is no .trace() method.
+The hierarchy is:
+
+    start_as_current_span()        ← root span (acts as the trace)
+        update_current_trace()     ← set trace-level name / input / output
+        start_as_current_span()    ← child span  (e.g. retrieval step)
+        start_as_current_generation() ← LLM call (model, tokens, etc.)
 
 Usage
 -----
 from mathpackage import LangfuseTracer
 
-tracer = LangfuseTracer()                        # reads keys from env
-result = tracer.trace_llm_judge("What is 2+2?")  # runs + traces
-result = tracer.trace_similarity("cat", "kitten") # runs + traces
-tracer.flush()                                    # send all events
+tracer = LangfuseTracer()
 
-Environment variables required
--------------------------------
+# Pre-built traced helpers
+result = tracer.trace_llm_judge("What is 2+2?")
+result = tracer.trace_similarity("cat", "kitten")
+tracer.flush()
+
+# Raw trace — instrument your own code
+with tracer.start_trace("my-pipeline", input={"query": "..."}) as span:
+    span.update(output="done")
+tracer.flush()
+
+Environment variables
+---------------------
 LANGFUSE_PUBLIC_KEY  — from https://us.cloud.langfuse.com → Settings → API Keys
 LANGFUSE_SECRET_KEY  — from the same page
 LANGFUSE_HOST        — defaults to https://us.cloud.langfuse.com
 """
 
 import os
+from contextlib import contextmanager
 from typing import Any, Optional
 
 
 class LangfuseTracer:
     """
-    Thin, importable wrapper around the Langfuse Python SDK.
-
-    Provides:
-      - trace_llm_judge()   : run llm_judge() and record both LLM calls
-      - trace_similarity()  : run text_similarity() and record the embedding call
-      - start_trace()       : open a raw trace for custom instrumentation
-      - flush()             : push all buffered events to Langfuse
-      - .client             : direct access to the underlying Langfuse object
+    Thin, importable wrapper around the Langfuse v3 Python SDK.
 
     Parameters
     ----------
     public_key : str, optional
-        Langfuse public key. Falls back to LANGFUSE_PUBLIC_KEY env var.
+        Falls back to LANGFUSE_PUBLIC_KEY env var.
     secret_key : str, optional
-        Langfuse secret key. Falls back to LANGFUSE_SECRET_KEY env var.
+        Falls back to LANGFUSE_SECRET_KEY env var.
     host : str, optional
-        Langfuse host URL. Defaults to https://us.cloud.langfuse.com
-        (the US cloud instance).
+        Falls back to LANGFUSE_HOST env var, then https://us.cloud.langfuse.com.
     enabled : bool
-        Set to False to disable all tracing (useful in testing / CI).
+        Set False to disable all tracing (useful in tests / CI).
     """
 
     def __init__(
@@ -61,19 +69,16 @@ class LangfuseTracer:
         try:
             from langfuse import Langfuse
         except ImportError:
-            raise ImportError(
-                "langfuse package is required: pip install langfuse"
-            )
+            raise ImportError("langfuse package is required: pip install langfuse")
 
         self._client = Langfuse(
             public_key=public_key or os.environ.get("LANGFUSE_PUBLIC_KEY"),
             secret_key=secret_key or os.environ.get("LANGFUSE_SECRET_KEY"),
-            host=host
-            or os.environ.get("LANGFUSE_HOST", "https://us.cloud.langfuse.com"),
+            host=host or os.environ.get("LANGFUSE_HOST", "https://us.cloud.langfuse.com"),
         )
 
     # ------------------------------------------------------------------ #
-    #  High-level traced helpers                                           #
+    #  Pre-built traced helpers                                            #
     # ------------------------------------------------------------------ #
 
     def trace_llm_judge(
@@ -82,50 +87,57 @@ class LangfuseTracer:
         model: str = "claude-sonnet-4-6",
     ) -> dict:
         """
-        Run llm_judge() and record both API calls (answer + judge) as
-        separate Langfuse generations inside one trace.
+        Run llm_judge() and record both LLM calls (answer + judge)
+        as Langfuse generations inside one root span.
 
-        Returns
-        -------
-        dict  — same as llm_judge(): {question, answer, judgment, verdict}
+        Returns the same dict as llm_judge():
+            {question, answer, judgment, verdict}
         """
         from .llm_judge import llm_judge
 
         result = llm_judge(question, model=model)
 
         if self.enabled and self._client:
-            trace = self._client.trace(
+            with self._client.start_as_current_span(
                 name="llm-judge",
                 input=question,
-                output=result["verdict"],
-                metadata={"model": model},
-            )
+            ) as span:
+                self._client.update_current_trace(
+                    name="llm-judge",
+                    input=question,
+                    output=result["verdict"],
+                    metadata={"model": model},
+                )
 
-            # Generation 1 — the answering call
-            trace.generation(
-                name="answer-generation",
-                model=model,
-                input=[{"role": "user", "content": question}],
-                output=result["answer"],
-            )
+                # Generation 1 — the answering call
+                with self._client.start_as_current_generation(
+                    name="answer-generation",
+                    model=model,
+                    input=[{"role": "user", "content": question}],
+                    output=result["answer"],
+                ):
+                    pass  # work already done above; we're just recording
 
-            # Generation 2 — the judging call
-            trace.generation(
-                name="judge-generation",
-                model=model,
-                input=[
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Question: {question}\n"
-                            f"Answer: {result['answer']}\n"
-                            f"Evaluate the answer."
-                        ),
-                    }
-                ],
-                output=result["judgment"],
-                metadata={"verdict": result["verdict"]},
-            )
+                # Generation 2 — the judging call
+                with self._client.start_as_current_generation(
+                    name="judge-generation",
+                    model=model,
+                    input=[
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Question: {question}\n"
+                                f"Answer: {result['answer']}\n"
+                                "Evaluate the answer."
+                            ),
+                        }
+                    ],
+                    output=result["judgment"],
+                    metadata={"verdict": result["verdict"]},
+                ):
+                    pass
+
+                span.update(output=result["verdict"])
 
             self._client.flush()
 
@@ -139,29 +151,35 @@ class LangfuseTracer:
     ) -> dict:
         """
         Run text_similarity() and record the embedding call as a
-        Langfuse span inside one trace.
+        Langfuse span inside one root span.
 
-        Returns
-        -------
-        dict  — same as text_similarity(): {text1, text2, similarity}
+        Returns the same dict as text_similarity():
+            {text1, text2, similarity}
         """
         from .similarity import text_similarity
 
         result = text_similarity(text1, text2, model=model)
 
         if self.enabled and self._client:
-            trace = self._client.trace(
+            with self._client.start_as_current_span(
                 name="text-similarity",
                 input={"text1": text1, "text2": text2},
-                output={"similarity": result["similarity"]},
-            )
+            ) as span:
+                self._client.update_current_trace(
+                    name="text-similarity",
+                    input={"text1": text1, "text2": text2},
+                    output={"similarity": result["similarity"]},
+                )
 
-            trace.span(
-                name="embedding-cosine-similarity",
-                input={"text1": text1, "text2": text2},
-                output={"similarity": result["similarity"]},
-                metadata={"model": model},
-            )
+                with self._client.start_as_current_span(
+                    name="embedding-cosine-similarity",
+                    input={"text1": text1, "text2": text2},
+                    output={"similarity": result["similarity"]},
+                    metadata={"model": model},
+                ):
+                    pass
+
+                span.update(output={"similarity": result["similarity"]})
 
             self._client.flush()
 
@@ -179,34 +197,48 @@ class LangfuseTracer:
         tags: Optional[list] = None,
     ):
         """
-        Open a raw Langfuse trace. Use this in your own app to instrument
-        any code, not just the functions in this package.
-
-        Returns the Langfuse trace object (or None if tracing is disabled).
+        Return a context manager that opens a root Langfuse span.
+        Use this in your own app to instrument any code.
 
         Example
         -------
         tracer = LangfuseTracer()
-        trace = tracer.start_trace("my-pipeline", input={"query": "..."})
-        span  = trace.span(name="step-1", input=..., output=...)
-        gen   = trace.generation(name="llm-call", model="...", ...)
+
+        with tracer.start_trace("my-pipeline", input={"query": "..."}) as span:
+            # update trace-level fields
+            tracer.client.update_current_trace(
+                name="my-pipeline",
+                input={"query": "..."},
+                output="final answer",
+            )
+            # add a child span
+            with tracer.client.start_as_current_span(name="retrieval") as s:
+                s.update(output=docs)
+            # add an LLM generation
+            with tracer.client.start_as_current_generation(
+                name="llm-call", model="gpt-4o",
+                input=[...], output="response"
+            ):
+                pass
+            span.update(output="done")
+
         tracer.flush()
+
+        Returns
+        -------
+        Context manager yielding a LangfuseSpan (or a no-op if disabled).
         """
         if not self.enabled or self._client is None:
-            return None
+            return _noop_context()
 
-        return self._client.trace(
+        return self._client.start_as_current_span(
             name=name,
             input=input,
             metadata=metadata or {},
-            tags=tags or [],
         )
 
     def flush(self) -> None:
-        """
-        Flush all buffered Langfuse events to the server.
-        Call this at the end of a script or request lifecycle.
-        """
+        """Push all buffered events to Langfuse. Call at end of script/request."""
         if self.enabled and self._client:
             self._client.flush()
 
@@ -218,15 +250,18 @@ class LangfuseTracer:
     def client(self):
         """
         Direct access to the underlying Langfuse client for advanced use
-        (scores, datasets, prompt management, etc.).
+        (scores, datasets, prompt management, experiments, etc.).
         """
         return self._client
 
     def __repr__(self) -> str:
         status = "enabled" if self.enabled else "disabled"
-        host = (
-            self._client.base_url
-            if self._client and hasattr(self._client, "base_url")
-            else "https://us.cloud.langfuse.com"
-        )
-        return f"LangfuseTracer(status={status}, host={host})"
+        return f"LangfuseTracer(status={status})"
+
+
+# ── helpers ────────────────────────────────────────────────────────────────────
+
+@contextmanager
+def _noop_context():
+    """A no-op context manager returned when tracing is disabled."""
+    yield None
